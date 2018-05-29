@@ -881,10 +881,12 @@ static void init_signal_handler(int signal) {
     }
 }
 
-static int clone_init_fn(void *) {
+static int clone_init_fn(void * clone_arg) {
     // a dummy init process in new pid namespace
     // intended to be killed via SIGKILL from root pid namespace
     prctl(PR_SET_PDEATHSIG, SIGHUP);
+    int *pipe_fd = (int*) clone_arg;
+    close(pipe_fd[0]);
 
     {
         struct sigaction action;
@@ -906,9 +908,14 @@ static int clone_init_fn(void *) {
     {
         list<int> fds = get_fds();
         INFO("init is running");
-        FOR_EACH(fd, fds) close(fd);
+        FOR_EACH(fd, fds){
+            if (fd != pipe_fd[1])
+                close(fd);
+        }
     }
-
+    char ch = 'X';
+    while (write(pipe_fd[1], &ch, 1) <= 0);
+    close(pipe_fd[1]);
     while (1) pause();
     return 0;
 }
@@ -1093,18 +1100,24 @@ pid_t Cgroup::spawn(spawn_arg& arg) {
     // CLONE_NEWUSER is not used because new uid 0 may be non-root
     int clone_flags = CLONE_NEWNS | SIGCHLD | arg.clone_flags;
 
+    int pipe_fd[2];
     // older kernel (ex. Debian 7, 3.2.0) doesn't support setns(whatever, CLONE_PIDNS)
     // just do not create init process in that case.
     if (is_setns_pidns_supported() && (clone_flags & CLONE_NEWPID) == CLONE_NEWPID) {
         // create a dummy init process in a new namespace
         // CLONE_PTRACE: prevent the process being traced by another process
         INFO("spawning dummy init process");
+        if (pipe(pipe_fd) < 0) {
+            ERROR("can not create pipe");
+            return -3;
+        }
         int init_clone_flags = CLONE_NEWPID;
-        init_pid_ = clone(clone_init_fn, (void*)((char*)alloca(stack_size) + stack_size), init_clone_flags, &arg);
+        init_pid_ = clone(clone_init_fn, (void*)((char*)alloca(stack_size) + stack_size), init_clone_flags, pipe_fd);
         if (init_pid_ < 0) {
             ERROR("can not spawn init process");
             return -3;
         }
+        close(pipe_fd[1]);
 
         // switch to that pid namespace for our next clone
         string pidns_path = string(fs::PROC_PATH) + "/" + strconv::from_ulong((unsigned long)init_pid_) + "/ns/pid";
@@ -1128,6 +1141,12 @@ pid_t Cgroup::spawn(spawn_arg& arg) {
 
     DEBUG_DO {
         INFO("clone flags = 0x%x = %s", (int)clone_flags, clone_flags_to_str(clone_flags).c_str());
+    }
+
+    if (init_pid_) {
+        char ch = '_';
+        ssize_t rret = read(pipe_fd[0], &ch, 1);
+        close(pipe_fd[0]);
     }
 
     // do sync use socket pair
